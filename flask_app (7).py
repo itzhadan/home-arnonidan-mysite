@@ -1,0 +1,749 @@
+from flask import Flask, request, jsonify, render_template_string, session, redirect, send_from_directory, Response
+import sqlite3
+import requests
+import os
+import csv
+import io
+import datetime
+import re
+
+app = Flask(__name__)
+app.secret_key = "expresphone-secret"
+
+# =========================================================
+# CONFIG — השארתי לפי הקוד שעבד לך
+# =========================================================
+VERIFY_TOKEN = "12345"
+
+# טוקן וואטסאפ שלך
+TOKEN = "EAAVn46q2xwMBRUaB4MkiNGONeko7q0HCNksXZCFqyIxD1VIM3jvHjdrO45aoTUIyZASmjaGOEZBJjn0qKmgYUEeTCFXm3cVu3UxYgfsvblhq7jr4n5jbkZBF822EAyGshXofMJUd8WWIXM3h37k12wZCHOha8q7gMm3I98MEOaFhMLRBZANHVdSWPAcFMJMAZDZD"
+
+PHONE_ID = "1107531305773314"
+
+# קוד כניסה לדשבורד
+ACCESS_CODES = ["1111"]
+
+# תיקיית קבצים — לפי מה שעבד אצלך
+BASE_MEDIA_PATH = "/home/arnonidan/static"
+DB_PATH = "/home/arnonidan/mysite/chat_dashboard.db"
+
+os.makedirs(BASE_MEDIA_PATH, exist_ok=True)
+
+# =========================================================
+# HELPERS
+# =========================================================
+def now_str():
+    return datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+def safe_filename(name):
+    name = str(name or "file")
+    name = re.sub(r"[^A-Za-z0-9_.-]", "_", name)
+    return name[:120]
+
+def db():
+    return sqlite3.connect(DB_PATH, check_same_thread=False)
+
+def init_db():
+    con = db()
+    c = con.cursor()
+
+    c.execute("""
+    CREATE TABLE IF NOT EXISTS chat_contacts (
+        wa_id TEXT PRIMARY KEY,
+        name TEXT,
+        source_number TEXT,
+        last_seen TEXT
+    )
+    """)
+
+    c.execute("""
+    CREATE TABLE IF NOT EXISTS chat_messages (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        wa_id TEXT,
+        name TEXT,
+        direction TEXT,
+        message_type TEXT,
+        text TEXT,
+        media_file TEXT,
+        created_at TEXT
+    )
+    """)
+
+    con.commit()
+    con.close()
+
+init_db()
+
+def upsert_contact(wa_id, name="", source_number=""):
+    con = db()
+    c = con.cursor()
+    c.execute("""
+    INSERT INTO chat_contacts (wa_id, name, source_number, last_seen)
+    VALUES (?, ?, ?, ?)
+    ON CONFLICT(wa_id) DO UPDATE SET
+        name=COALESCE(NULLIF(excluded.name,''), chat_contacts.name),
+        source_number=COALESCE(NULLIF(excluded.source_number,''), chat_contacts.source_number),
+        last_seen=excluded.last_seen
+    """, (wa_id, name or "", source_number or "", now_str()))
+    con.commit()
+    con.close()
+
+def save_message(wa_id, name, direction, message_type, text="", media_file=""):
+    con = db()
+    c = con.cursor()
+    c.execute("""
+    INSERT INTO chat_messages
+    (wa_id, name, direction, message_type, text, media_file, created_at)
+    VALUES (?, ?, ?, ?, ?, ?, ?)
+    """, (wa_id, name or "", direction, message_type or "text", text or "", media_file or "", now_str()))
+    con.commit()
+    con.close()
+
+def get_media_extension(mime_type, fallback):
+    mime_type = (mime_type or "").lower()
+    if "ogg" in mime_type or "opus" in mime_type:
+        return ".ogg"
+    if "mpeg" in mime_type or "mp3" in mime_type:
+        return ".mp3"
+    if "wav" in mime_type:
+        return ".wav"
+    if "jpeg" in mime_type or "jpg" in mime_type:
+        return ".jpg"
+    if "png" in mime_type:
+        return ".png"
+    if "webp" in mime_type:
+        return ".webp"
+    if "mp4" in mime_type:
+        return ".mp4"
+    if "pdf" in mime_type:
+        return ".pdf"
+    return fallback
+
+def download_whatsapp_media(media_id, fallback_ext):
+    headers = {"Authorization": f"Bearer {TOKEN}"}
+
+    meta_res = requests.get(
+        f"https://graph.facebook.com/v18.0/{media_id}",
+        headers=headers,
+        timeout=30
+    )
+    meta = meta_res.json()
+    file_url = meta.get("url")
+    mime_type = meta.get("mime_type", "")
+
+    if not file_url:
+        print("MEDIA META ERROR:", meta)
+        return ""
+
+    media_res = requests.get(file_url, headers=headers, timeout=90)
+
+    if media_res.status_code != 200:
+        print("MEDIA DOWNLOAD ERROR:", media_res.status_code, media_res.text[:300])
+        return ""
+
+    ext = get_media_extension(mime_type, fallback_ext)
+    filename = safe_filename(f"{media_id}{ext}")
+    path = os.path.join(BASE_MEDIA_PATH, filename)
+
+    with open(path, "wb") as f:
+        f.write(media_res.content)
+
+    return filename
+
+def send_message(to, text, save_out=True):
+    url = f"https://graph.facebook.com/v18.0/{PHONE_ID}/messages"
+    headers = {
+        "Authorization": f"Bearer {TOKEN}",
+        "Content-Type": "application/json"
+    }
+    payload = {
+        "messaging_product": "whatsapp",
+        "to": to,
+        "type": "text",
+        "text": {"body": text}
+    }
+
+    r = requests.post(url, headers=headers, json=payload, timeout=30)
+    print("SEND:", r.status_code, r.text[:500])
+
+    if save_out:
+        save_message(to, "אני", "out", "text", text, "")
+
+    return r.text
+
+def auto_reply_for(message_type):
+    if message_type == "audio":
+        return "🎤 קיבלנו את ההודעה הקולית שלך. נציגנו יחזרו אליך בהקדם 🙏"
+    if message_type == "image":
+        return "📷 קיבלנו את התמונה שלך. נציגנו יחזרו אליך בהקדם 🙏"
+    if message_type == "video":
+        return "🎥 קיבלנו את הווידאו שלך. נציגנו יחזרו אליך בהקדם 🙏"
+    if message_type == "document":
+        return "📄 קיבלנו את הקובץ שלך. נציגנו יחזרו אליך בהקדם 🙏"
+    return "היי 👋 קיבלנו את הפנייה שלך. נציג יחזור אליך בהקדם 🙏"
+
+# =========================================================
+# FILE SERVE
+# =========================================================
+@app.route("/file/<path:name>")
+def serve_file(name):
+    return send_from_directory(BASE_MEDIA_PATH, name, as_attachment=False)
+
+# =========================================================
+# LOGIN / LOGOUT
+# =========================================================
+@app.route("/login", methods=["GET", "POST"])
+def login():
+    if request.method == "POST":
+        if request.form.get("code") in ACCESS_CODES:
+            session["ok"] = True
+            return redirect("/")
+        return """
+        <html dir="rtl"><body style="background:#0b141a;color:white;font-family:Arial;text-align:center;padding-top:120px;font-size:30px">
+        ❌ קוד שגוי<br><br><a style="color:#25d366" href="/login">נסה שוב</a>
+        </body></html>
+        """
+
+    return """
+    <html dir="rtl">
+    <head>
+    <meta charset="utf-8">
+    <style>
+    body{background:#0b141a;color:white;font-family:Arial;text-align:center;padding-top:120px}
+    input{font-size:34px;padding:18px;border-radius:14px;border:0;width:260px;text-align:center}
+    button{font-size:34px;padding:18px 50px;border-radius:16px;border:0;background:#25d366;color:#06130d;font-weight:bold}
+    h1{font-size:42px}
+    </style>
+    </head>
+    <body>
+        <h1>🔐 כניסה למערכת</h1>
+        <form method="post">
+            <input name="code" placeholder="קוד">
+            <br><br>
+            <button>כניסה</button>
+        </form>
+    </body>
+    </html>
+    """
+
+@app.route("/logout")
+def logout():
+    session.clear()
+    return redirect("/login")
+
+# =========================================================
+# WEBHOOK
+# =========================================================
+@app.route("/webhook", methods=["GET"])
+def verify():
+    if request.args.get("hub.verify_token") == VERIFY_TOKEN:
+        return request.args.get("hub.challenge", "")
+    return "error", 403
+
+@app.route("/webhook", methods=["POST"])
+def webhook():
+    data = request.get_json(silent=True) or {}
+    print("DATA:", data)
+
+    try:
+        value = data["entry"][0]["changes"][0]["value"]
+
+        if "messages" not in value:
+            return jsonify(ok=True)
+
+        msg = value["messages"][0]
+        sender = msg.get("from", "")
+        msg_type = msg.get("type", "unknown")
+
+        name = ""
+        try:
+            name = value.get("contacts", [{}])[0].get("profile", {}).get("name", "")
+        except Exception:
+            pass
+
+        source_number = value.get("metadata", {}).get("display_phone_number", "")
+
+        text = ""
+        media_file = ""
+
+        if msg_type == "text":
+            text = msg.get("text", {}).get("body", "")
+
+        elif msg_type == "audio":
+            media_id = msg.get("audio", {}).get("id")
+            media_file = download_whatsapp_media(media_id, ".ogg") if media_id else ""
+            text = "🎤 הודעה קולית"
+
+        elif msg_type == "image":
+            media_id = msg.get("image", {}).get("id")
+            media_file = download_whatsapp_media(media_id, ".jpg") if media_id else ""
+            caption = msg.get("image", {}).get("caption", "")
+            text = caption or "📷 תמונה"
+
+        elif msg_type == "video":
+            media_id = msg.get("video", {}).get("id")
+            media_file = download_whatsapp_media(media_id, ".mp4") if media_id else ""
+            caption = msg.get("video", {}).get("caption", "")
+            text = caption or "🎥 וידאו"
+
+        elif msg_type == "document":
+            media_id = msg.get("document", {}).get("id")
+            original_name = msg.get("document", {}).get("filename", "")
+            media_file = download_whatsapp_media(media_id, ".bin") if media_id else ""
+            text = original_name or "📄 קובץ"
+
+        else:
+            text = f"📩 הודעה מסוג {msg_type}"
+
+        upsert_contact(sender, name, source_number)
+        save_message(sender, name, "in", msg_type, text, media_file)
+
+        # תגובה אוטומטית לפי סוג ההודעה
+        send_message(sender, auto_reply_for(msg_type), save_out=True)
+
+    except Exception as e:
+        print("WEBHOOK ERROR:", e)
+
+    return jsonify(ok=True)
+
+# =========================================================
+# SEND FROM PANEL
+# =========================================================
+@app.route("/send", methods=["POST"])
+def send_panel():
+    if not session.get("ok"):
+        return redirect("/login")
+
+    to = request.form.get("to", "").strip()
+    msg = request.form.get("msg", "").strip()
+
+    if to and msg:
+        send_message(to, msg, save_out=True)
+
+    return redirect(f"/?chat={to}")
+
+# =========================================================
+# BROADCAST
+# =========================================================
+@app.route("/broadcast", methods=["POST"])
+def broadcast():
+    if not session.get("ok"):
+        return redirect("/login")
+
+    msg = request.form.get("msg", "").strip()
+    if not msg:
+        return redirect("/")
+
+    con = db()
+    rows = con.cursor().execute("SELECT wa_id FROM chat_contacts ORDER BY last_seen DESC").fetchall()
+    con.close()
+
+    sent = 0
+    for (wa_id,) in rows:
+        try:
+            send_message(wa_id, msg, save_out=True)
+            sent += 1
+        except Exception as e:
+            print("BROADCAST ERROR:", wa_id, e)
+
+    return redirect(f"/?broadcast_sent={sent}")
+
+# =========================================================
+# EXPORT
+# =========================================================
+@app.route("/export")
+def export():
+    if not session.get("ok"):
+        return redirect("/login")
+
+    con = db()
+    rows = con.cursor().execute("""
+        SELECT c.wa_id, c.name, c.source_number, c.last_seen,
+               (SELECT text FROM chat_messages m WHERE m.wa_id=c.wa_id ORDER BY id DESC LIMIT 1) AS last_text
+        FROM chat_contacts c
+        ORDER BY c.last_seen DESC
+    """).fetchall()
+    con.close()
+
+    output = io.StringIO()
+    writer = csv.writer(output)
+    writer.writerow(["Phone", "Name", "Source Number", "Last Seen", "Last Message"])
+    writer.writerows(rows)
+
+    csv_text = "\ufeff" + output.getvalue()
+
+    return Response(
+        csv_text,
+        mimetype="text/csv; charset=utf-8",
+        headers={"Content-Disposition": "attachment; filename=contacts.csv"}
+    )
+
+# =========================================================
+# DASHBOARD — ROOT
+# =========================================================
+@app.route("/")
+def dashboard():
+    if not session.get("ok"):
+        return redirect("/login")
+
+    selected = request.args.get("chat", "").strip()
+    sent_count = request.args.get("broadcast_sent", "")
+
+    con = db()
+    c = con.cursor()
+
+    contacts = c.execute("""
+        SELECT c.wa_id, c.name, c.source_number, c.last_seen,
+               (SELECT message_type FROM chat_messages m WHERE m.wa_id=c.wa_id ORDER BY id DESC LIMIT 1) AS last_type,
+               (SELECT text FROM chat_messages m WHERE m.wa_id=c.wa_id ORDER BY id DESC LIMIT 1) AS last_text
+        FROM chat_contacts c
+        ORDER BY c.last_seen DESC
+    """).fetchall()
+
+    if not selected and contacts:
+        selected = contacts[0][0]
+
+    messages = []
+    current_name = ""
+    if selected:
+        row = c.execute("SELECT name FROM chat_contacts WHERE wa_id=?", (selected,)).fetchone()
+        current_name = row[0] if row else selected
+        messages = c.execute("""
+            SELECT direction, message_type, text, media_file, created_at
+            FROM chat_messages
+            WHERE wa_id=?
+            ORDER BY id ASC
+        """, (selected,)).fetchall()
+
+    con.close()
+
+    return render_template_string("""
+<!doctype html>
+<html lang="he" dir="rtl">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>מערכת שיחות</title>
+<style>
+*{box-sizing:border-box}
+body{
+    margin:0;
+    background:#0b141a;
+    color:#e9edef;
+    font-family:Arial, sans-serif;
+    font-size:22px;
+}
+.app{
+    height:100vh;
+    display:grid;
+    grid-template-columns:330px 1fr;
+}
+.sidebar{
+    background:#111b21;
+    border-left:1px solid #2a3942;
+    overflow:auto;
+}
+.header{
+    background:#202c33;
+    padding:18px;
+    display:flex;
+    justify-content:space-between;
+    align-items:center;
+    gap:10px;
+}
+.header-title{
+    color:#25d366;
+    font-weight:bold;
+    font-size:26px;
+}
+.big-link, .big-btn{
+    display:inline-block;
+    background:#25d366;
+    color:#06130d;
+    text-decoration:none;
+    border:0;
+    border-radius:14px;
+    padding:13px 18px;
+    font-size:22px;
+    font-weight:bold;
+    margin:4px;
+    cursor:pointer;
+}
+.logout{
+    background:#ff5c5c;
+    color:white;
+}
+.export{
+    background:#34b7f1;
+    color:#06130d;
+}
+.contact{
+    display:block;
+    color:white;
+    text-decoration:none;
+    padding:16px;
+    border-bottom:1px solid #223039;
+}
+.contact.active{
+    background:#2a3942;
+}
+.contact-name{
+    font-size:23px;
+    font-weight:bold;
+}
+.contact-phone{
+    color:#aebac1;
+    font-size:18px;
+    margin-top:5px;
+}
+.contact-last{
+    color:#8696a0;
+    font-size:17px;
+    margin-top:7px;
+    white-space:nowrap;
+    overflow:hidden;
+    text-overflow:ellipsis;
+}
+.chat{
+    display:flex;
+    flex-direction:column;
+    height:100vh;
+    background:#0b141a;
+}
+.chat-head{
+    background:#202c33;
+    padding:16px;
+    font-size:26px;
+    font-weight:bold;
+    color:#e9edef;
+}
+.messages{
+    flex:1;
+    overflow:auto;
+    padding:22px;
+    background:#0b141a;
+}
+.bubble-wrap{
+    display:flex;
+    margin:12px 0;
+}
+.bubble-wrap.in{justify-content:flex-start}
+.bubble-wrap.out{justify-content:flex-end}
+.bubble{
+    max-width:72%;
+    padding:14px 16px;
+    border-radius:16px;
+    line-height:1.45;
+    box-shadow:0 1px 2px rgba(0,0,0,.35);
+    word-wrap:break-word;
+}
+.bubble.in{
+    background:#202c33;
+    color:#e9edef;
+    border-top-right-radius:4px;
+}
+.bubble.out{
+    background:#005c4b;
+    color:white;
+    border-top-left-radius:4px;
+}
+.time{
+    font-size:15px;
+    color:#aebac1;
+    margin-top:8px;
+}
+audio, video{
+    width:100%;
+    margin-top:8px;
+}
+img.chat-img{
+    max-width:100%;
+    border-radius:12px;
+    margin-top:8px;
+}
+.download{
+    color:#53bdeb;
+    display:inline-block;
+    margin-top:10px;
+    font-size:20px;
+}
+.reply-box{
+    background:#202c33;
+    padding:14px;
+    display:flex;
+    gap:10px;
+}
+.reply-box input{
+    flex:1;
+    border:0;
+    border-radius:14px;
+    padding:16px;
+    font-size:22px;
+    background:#2a3942;
+    color:white;
+}
+.reply-box button{
+    border:0;
+    border-radius:14px;
+    padding:16px 24px;
+    font-size:22px;
+    background:#25d366;
+    color:#06130d;
+    font-weight:bold;
+}
+.broadcast{
+    padding:14px;
+    border-bottom:1px solid #2a3942;
+}
+.broadcast textarea{
+    width:100%;
+    min-height:85px;
+    border:0;
+    border-radius:12px;
+    padding:12px;
+    font-size:20px;
+    background:#2a3942;
+    color:white;
+}
+.empty{
+    color:#aebac1;
+    padding:40px;
+    text-align:center;
+    font-size:26px;
+}
+.notice{
+    background:#075e54;
+    color:white;
+    padding:12px;
+    text-align:center;
+    font-size:20px;
+}
+@media(max-width:800px){
+    .app{grid-template-columns:1fr}
+    .sidebar{height:42vh}
+    .chat{height:58vh}
+    .bubble{max-width:88%}
+}
+</style>
+</head>
+<body>
+
+{% if sent_count %}
+<div class="notice">✅ נשלח ל־{{sent_count}} אנשי קשר</div>
+{% endif %}
+
+<div class="app">
+
+    <div class="sidebar">
+        <div class="header">
+            <div class="header-title">💬 שיחות</div>
+            <div>
+                <a class="big-link export" href="/export">ייצוא</a>
+                <a class="big-link logout" href="/logout">יציאה</a>
+            </div>
+        </div>
+
+        <div class="broadcast">
+            <form action="/broadcast" method="post">
+                <textarea name="msg" placeholder="הודעה לשליחה לכולם..."></textarea>
+                <button class="big-btn" style="width:100%">📢 שלח לכולם</button>
+            </form>
+        </div>
+
+        {% if not contacts %}
+            <div class="empty">אין הודעות עדיין 📭</div>
+        {% endif %}
+
+        {% for c in contacts %}
+            <a class="contact {% if c[0] == selected %}active{% endif %}" href="/?chat={{c[0]}}">
+                <div class="contact-name">{{c[1] or "ללא שם"}}</div>
+                <div class="contact-phone">📞 {{c[0]}}</div>
+                <div class="contact-last">
+                    {% if c[4] == "audio" %}🎤 קול
+                    {% elif c[4] == "image" %}📷 תמונה
+                    {% elif c[4] == "video" %}🎥 וידאו
+                    {% elif c[4] == "document" %}📄 קובץ
+                    {% else %}{{c[5] or ""}}
+                    {% endif %}
+                </div>
+            </a>
+        {% endfor %}
+    </div>
+
+    <div class="chat">
+        <div class="chat-head">
+            {% if selected %}
+                {{current_name or selected}} — {{selected}}
+            {% else %}
+                בחר שיחה
+            {% endif %}
+        </div>
+
+        <div class="messages" id="messages">
+            {% if not selected %}
+                <div class="empty">אין שיחה להצגה</div>
+            {% endif %}
+
+            {% for m in messages %}
+                <div class="bubble-wrap {{m[0]}}">
+                    <div class="bubble {{m[0]}}">
+                        {% if m[1] == "audio" %}
+                            <div>🎤 הודעה קולית</div>
+                            <audio controls>
+                                <source src="/file/{{m[3]}}" type="audio/ogg">
+                            </audio>
+                            <a class="download" href="/file/{{m[3]}}" download>⬇️ הורד קול</a>
+
+                        {% elif m[1] == "image" %}
+                            <div>{{m[2] or "📷 תמונה"}}</div>
+                            <img class="chat-img" src="/file/{{m[3]}}">
+                            <br><a class="download" href="/file/{{m[3]}}" download>⬇️ הורד תמונה</a>
+
+                        {% elif m[1] == "video" %}
+                            <div>{{m[2] or "🎥 וידאו"}}</div>
+                            <video controls>
+                                <source src="/file/{{m[3]}}" type="video/mp4">
+                            </video>
+                            <a class="download" href="/file/{{m[3]}}" download>⬇️ הורד וידאו</a>
+
+                        {% elif m[1] == "document" %}
+                            <div>📄 {{m[2] or "קובץ"}}</div>
+                            <a class="download" href="/file/{{m[3]}}" download>⬇️ הורד קובץ</a>
+
+                        {% else %}
+                            {{m[2]}}
+                        {% endif %}
+                        <div class="time">{{m[4]}}</div>
+                    </div>
+                </div>
+            {% endfor %}
+        </div>
+
+        {% if selected %}
+        <form class="reply-box" action="/send" method="post">
+            <input type="hidden" name="to" value="{{selected}}">
+            <input name="msg" placeholder="כתוב תגובה ללקוח...">
+            <button>שלח</button>
+        </form>
+        {% endif %}
+    </div>
+
+</div>
+
+<script>
+var box = document.getElementById("messages");
+if (box) { box.scrollTop = box.scrollHeight; }
+</script>
+
+</body>
+</html>
+""",
+    contacts=contacts,
+    messages=messages,
+    selected=selected,
+    current_name=current_name,
+    sent_count=sent_count
+    )
+
+# PythonAnywhere
+application = app
